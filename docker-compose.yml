@@ -1,0 +1,82 @@
+services:
+  app:
+    image: python/video_check:3.12-slim
+    container_name: video-duplicate-check-python
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${API_PORT}:${API_PORT}"
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+    volumes:
+      - ./logs:/app/logs
+      - ./video:/app/video
+      - ./app:/app/app
+      - ./.env:/app/.env
+      - ./main.py:/app/main.py
+      - ./test.py:/app/test.py
+      - ./supervisor:/etc/supervisor/conf.d
+    depends_on:
+      - redis
+    networks:
+      - video_check_net
+    restart: unless-stopped
+    command: python main.py
+    # command: >
+    #   sh -c '
+    #     mkdir -p /app/logs/supervisor && \
+    #     touch /app/logs/supervisor/supervisord.log && \
+    #     touch /app/logs/supervisor/video_duplicate_check.log && \
+    #     chmod -R 755 /app/logs/supervisor/ && \
+    #     chown -R root:root /app/logs/supervisor/ && \
+    #     supervisord -c /etc/supervisor/conf.d/supervisord.conf &
+    #     python main.py'
+
+  redis:
+    image: redis:7-alpine
+    container_name: ${REDIS_HOST}
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    ports:
+      - "${MASTER_REDIS_PORT}:${REDIS_PORT}"
+    env_file:
+      - .env
+    volumes:
+      - ./redis/data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    restart: unless-stopped
+    networks:
+      - video_check_net
+  
+  mysql:
+    image: mysql:8.0
+    container_name: ${DB_HOST}
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_DATABASE}
+      MYSQL_USER: ${DB_USERNAME}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      TZ: Asia/Shanghai
+    ports:
+      - "${MASTER_DB_PORT}:${DB_PORT}"
+    volumes:
+      - ./mysql/my.cnf:/etc/mysql/conf.d/my.cnf
+      - ./mysql/data:/var/lib/mysql
+      - ./mysql/migrations:/etc/mysql/migrations
+    restart: unless-stopped
+    networks:
+      - video_check_net
+    command: --default-authentication-plugin=mysql_native_password
+
+volumes:
+  mysql_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  video_check_net:
+    driver: bridge

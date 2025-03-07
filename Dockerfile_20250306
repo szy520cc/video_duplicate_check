@@ -1,0 +1,43 @@
+# 第一阶段：构建依赖
+FROM python:3.12-slim as builder
+
+WORKDIR /app
+
+# 安装构建依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential=12.9 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+# 安装 Python 依赖到独立目录
+RUN pip install --upgrade pip \
+    && pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    && pip install --target=/app/packages --no-cache-dir -r requirements.txt
+
+# 第二阶段：运行时镜像
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# 安装运行时系统依赖
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    supervisor=4.2.5-1 \
+    libgl1 \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    && ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# 从构建阶段复制已安装的依赖
+COPY --from=builder /app/packages /usr/local/lib/python3.12/site-packages
+
+# # 复制应用代码
+# COPY . .
+
+# # 可选：设置环境变量确保 Python 能找到依赖
+# ENV PYTHONPATH=/usr/local/lib/python3.12/site-packages:$PYTHONPATH
