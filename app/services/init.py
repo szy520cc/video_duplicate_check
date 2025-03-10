@@ -101,16 +101,20 @@ class VideoSystemInitializer:
             try:
                 create_table_query = f"""
                 CREATE TABLE IF NOT EXISTS {self.table_name} (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    path VARCHAR(255) NOT NULL,
-                    feature_hash TEXT NOT NULL,
-                    file_hash VARCHAR(64) NOT NULL,
+                    id INT unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
+                    video_id INT unsigned NOT NULL COMMENT '业务系统视频-ID',
+                    industry_code VARCHAR(64) NOT NULL DEFAULT '' COMMENT '业务系统视频分类-Code',
+                    file_hash VARCHAR(64) NOT NULL DEFAULT '' COMMENT '文件内容哈希',
+                    feature_hash TEXT COMMENT '特征哈希',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    INDEX (file_hash)
+                    INDEX (file_hash),
+                    INDEX idx_feature_hash (feature_hash(64))
                 )
                 """
-                self.db.execute_query(create_table_query)
-                self.logger.info("数据表创建成功")
+                if self.db.execute_query(create_table_query):
+                    self.logger.info("数据表创建成功")
+                else:
+                    self.logger.info("数据表创建失败")
             except Exception as e:
                 self.logger.error(f"创建数据表失败: {e}")
                 raise
@@ -146,7 +150,7 @@ class VideoSystemInitializer:
         try:
             while True:
                 # 使用覆盖索引优化查询
-                query = f"SELECT id, file_hash, feature_hash, path FROM {self.table_name} WHERE id > %s ORDER BY id LIMIT %s"
+                query = f"SELECT id, video_id, industry_code, file_hash, feature_hash FROM {self.table_name} WHERE id > %s ORDER BY id LIMIT %s"
                 params = (last_id, batch_size)
 
                 # 使用流式游标获取数据
@@ -163,10 +167,12 @@ class VideoSystemInitializer:
                     # 使用pipeline批量操作
                     pipe = self.redis.pipeline()
                     for row in rows:
-                        video_id, file_hash, feature_hash, path = row
-                        pipe.set(f"file_hash:{file_hash}", video_id)
-                        pipe.set(f"feature_hash:{feature_hash}", video_id)
-                        last_id = video_id
+                        id, video_id, industry_code, file_hash, feature_hash = row
+                        # 使用JSON格式存储video_id和industry_code
+                        cache_value = f"{{\"video_id\":{video_id},\"industry_code\":\"{industry_code}\"}}"
+                        pipe.set(f"file_hash:{file_hash}", cache_value)
+                        pipe.set(f"feature_hash:{feature_hash}", cache_value)
+                        last_id = id
                         batch_count += 1
 
                     # 执行批量操作

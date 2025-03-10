@@ -2,6 +2,7 @@ import os
 import argparse
 import time
 import logging
+import json
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -82,9 +83,9 @@ class VideoDuplicateChecker:
             video_path (str): 待检查视频的文件路径
 
         Returns:
-            tuple: (is_duplicate, duplicate_path, similarity)
+            tuple: (is_duplicate, duplicate_info, similarity)
             - is_duplicate (bool): 是否检测到重复
-            - duplicate_path (str): 重复视频的路径
+            - duplicate_info (str): 重复视频的信息（JSON字符串）
             - similarity (float): 相似度值
 
         Raises:
@@ -105,21 +106,23 @@ class VideoDuplicateChecker:
         if self.redis.cache_enabled:
             self.logger.debug("检查Redis缓存...")
             # 首先从Redis缓存中检查是否存在相同的文件
-            cached_id = self.redis.get(f"file_hash:{file_hash}")
-            if cached_id:
+            cached_data = self.redis.get(f"file_hash:{file_hash}")
+            if cached_data:
                 self.logger.info("在Redis缓存中找到匹配文件")
-                return True, cached_id, 1.0
+                return True, cached_data, 1.0
 
         # 如果缓存中没有，再检查数据库
         self.logger.debug("在数据库中查找相同文件...")
-        file_check_query = f"SELECT id, path FROM {self.table_name} WHERE file_hash = %s"
+        file_check_query = f"SELECT video_id, industry_code FROM {self.table_name} WHERE file_hash = %s"
         result = self.db.fetch_one(file_check_query, (file_hash,))
         if result:
             self.logger.info("在数据库中找到完全相同的文件")
-            video_id, video_path = result
+            stored_video_id, stored_industry_code = result
+            # 构造统一的JSON格式返回值
+            duplicate_info = json.dumps({"video_id": stored_video_id, "industry_code": stored_industry_code})
             # 更新缓存
-            self.redis.set(f"file_hash:{file_hash}", video_id)
-            return True, video_id, 1.0
+            self.redis.set(f"file_hash:{file_hash}", duplicate_info)
+            return True, duplicate_info, 1.0
 
         # 提取新视频特征
         self.logger.debug("开始提取视频特征...")
@@ -136,12 +139,10 @@ class VideoDuplicateChecker:
                 self.logger.error(f"堆栈跟踪:\n{traceback.format_tb(e.__traceback__)}")
             raise ValueError(f"视频特征提取失败: {str(e)}")
 
-
         # 进行视频相似度比对
         self.logger.debug("开始进行视频相似度比对...")
         max_similarity = 0.0
-        duplicate_id = None
-        similar_videos = []
+        duplicate_info = None
 
         # 如果启用了缓存，先从Redis缓存中获取特征哈希进行比对
         if self.redis.cache_enabled:
@@ -156,7 +157,8 @@ class VideoDuplicateChecker:
                         # 从键名中提取特征哈希值（去掉"feature_hash:"前缀）
                         length_of_prefix = len("feature_hash:")
                         stored_feature_hash = key[length_of_prefix:]
-                        stored_id = self.redis.get(key)
+                        cached_data = self.redis.get(key)
+                        stored_info = json.loads(cached_data)
 
                         # 使用增强的相似度计算方法
                         is_duplicate, similarity = self.feature_manager.is_duplicate(
@@ -166,19 +168,15 @@ class VideoDuplicateChecker:
                         )
 
                         self.logger.debug(
-                            f"缓存比对结果: 视频 {video_path} 与 {stored_id} 的相似度为 {similarity:.4f}, 是否重复: {is_duplicate}")
-
-                        # 记录所有相似度超过0.7的视频，用于后续分析
-                        if similarity > 0.7:
-                            similar_videos.append((stored_id, similarity))
+                            f"缓存比对结果: 视频 {video_path} 与 video_id:{stored_info['video_id']} 的相似度为 {similarity:.4f}, 是否重复: {is_duplicate}")
 
                         if similarity > max_similarity:
                             max_similarity = similarity
-                            duplicate_id = stored_id
+                            duplicate_info = cached_data
 
                         if is_duplicate:
                             self.logger.info(f"在缓存中找到相似视频，相似度: {similarity:.2%}")
-                            return True, stored_id, similarity
+                            return True, duplicate_info, similarity
                     except Exception as e:
                         self.logger.error(f"从缓存计算相似度时出错: {e}")
 
@@ -191,14 +189,16 @@ class VideoDuplicateChecker:
         offset = 0
 
         while True:
-            query = f"SELECT id, path, feature_hash FROM {self.table_name} LIMIT %s OFFSET %s"
-            stored_videos = self.db.fetch_all(query, (batch_size, offset))
+            query = f"SELECT id, video_id, industry_code, feature_hash FROM {self.table_name} LIMIT %s OFFSET %s"
+            result = self.db.fetch_all(query, (batch_size, offset))
 
-            if not stored_videos:
+            if not result:
                 break
 
-            for stored_id, stored_path, stored_feature_hash in stored_videos:
+            for row in result:
                 try:
+                    stored_id, stored_video_id, stored_industry_code, stored_feature_hash = row
+
                     # 使用增强的相似度计算方法
                     is_duplicate, similarity = self.feature_manager.is_duplicate(
                         feature_hash,
@@ -207,44 +207,34 @@ class VideoDuplicateChecker:
                     )
 
                     self.logger.debug(
-                        f"数据库比对结果: 视频 {video_path} 与 {stored_path} 的相似度为 {similarity:.4f}, 是否重复: {is_duplicate}")
-                    # 记录所有相似度超过0.7的视频，用于后续分析
-                    if similarity > 0.7:
-                        similar_videos.append((stored_id, similarity))
+                        f"数据库比对结果: 视频 {video_path} 与 video_id:{stored_video_id} 的相似度为 {similarity:.4f}, 是否重复: {is_duplicate}")
+
                     if similarity > max_similarity:
                         max_similarity = similarity
-                        duplicate_id = stored_id
+                        duplicate_info = json.dumps({"video_id": stored_video_id, "industry_code": stored_industry_code})
+
                     if is_duplicate:
                         self.logger.info(f"在数据库中找到相似视频，相似度: {similarity:.2%}")
-                        # 更新缓存
-                        if self.redis.cache_enabled:
-                            self.redis.set(f"feature_hash:{stored_feature_hash}", stored_id)
-                        return True, stored_id, similarity
+                        return True, duplicate_info, similarity
+
                 except Exception as e:
                     self.logger.error(f"计算相似度时出错: {e}")
+                    continue
 
             offset += batch_size
-            if len(stored_videos) < batch_size:
-                break
 
-        # 输出相似度最高的几个视频，帮助分析
-        if similar_videos:
-            similar_videos.sort(key=lambda x: x[1], reverse=True)
-            self.logger.info("相似度较高但未达到阈值的视频:")
-            for i, (path, sim) in enumerate(similar_videos[:3]):
-                self.logger.info(f"{i + 1}. 路径: {path}, 相似度: {sim:.2%}")
+        # 如果没有找到重复视频
+        return False, None, max_similarity
 
-        self.logger.debug("视频相似度比对完成")
-        self.logger.info("视频检查完成")
-        return False, duplicate_id, max_similarity
-
-    def save_to_database(self, video_path, feature_hash, file_hash):
+    def save_to_database(self, video_path, feature_hash, file_hash, video_id, industry_code):
         """将视频信息保存到数据库
 
         Args:
             video_path (str): 视频文件路径
             feature_hash (str): 视频特征哈希值
             file_hash (str): 文件哈希值
+            video_id (int): 视频ID
+            industry_code (str): 行业代码
 
         Returns:
             tuple: (bool, int) 保存是否成功及新插入记录的ID
@@ -252,16 +242,16 @@ class VideoDuplicateChecker:
         self.logger.debug("正在将视频信息添加到数据库...")
         cursor = None
         try:
-            query = "INSERT INTO videos (path, feature_hash, file_hash) VALUES (%s, %s, %s)"
-            cursor = self.db.execute_query(query, (video_path, feature_hash, file_hash))
+            query = "INSERT INTO videos (video_id, industry_code, feature_hash, file_hash) VALUES (%s, %s, %s, %s)"
+            cursor = self.db.execute_query(query, (video_id, industry_code, feature_hash, file_hash))
             if cursor is None:
                 self.logger.error("视频信息添加到数据库失败")
                 return False, None
             
             # 获取新插入记录的ID
-            video_id = cursor.lastrowid
-            self.logger.debug(f"视频信息已成功添加到数据库，ID: {video_id}")
-            return True, video_id
+            id = cursor.lastrowid
+            self.logger.debug(f"视频信息已成功添加到数据库，ID: {id}")
+            return True, id
         except Exception as e:
             self.logger.error(f"添加视频到数据库时出错: {e}")
             return False
@@ -270,7 +260,7 @@ class VideoDuplicateChecker:
                 cursor.close()
 
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-    def update_cache(self, video_id, feature_hash, file_hash):
+    def update_cache(self, video_id, industry_code, feature_hash, file_hash):
         """更新Redis缓存
 
         使用tenacity库实现重试机制，包括：
@@ -278,7 +268,8 @@ class VideoDuplicateChecker:
         2. 每次重试间隔2秒
 
         Args:
-            video_id (str): 视频ID
+            video_id (int): 视频ID
+            industry_code (str): 行业代码
             feature_hash (str): 视频特征哈希值
             file_hash (str): 文件哈希值
 
@@ -292,8 +283,10 @@ class VideoDuplicateChecker:
         try:
             # 使用事务确保缓存更新的原子性
             with self.redis.pipeline() as pipe:
-                pipe.set(f"file_hash:{file_hash}", video_id)
-                pipe.set(f"feature_hash:{feature_hash}", video_id)
+                # 使用JSON格式存储video_id和industry_code
+                cache_value = f"{{\"video_id\":{video_id},\"industry_code\":\"{industry_code}\"}}"
+                pipe.set(f"file_hash:{file_hash}", cache_value)
+                pipe.set(f"feature_hash:{feature_hash}", cache_value)
                 # 设置缓存过期时间
                 cache_expire = int(os.getenv('CACHE_EXPIRE', '0'))
                 if cache_expire > 0:
@@ -313,7 +306,7 @@ class VideoDuplicateChecker:
                 self.logger.error(f"清理缓存失败: {cleanup_error}")
             raise  # 抛出异常以触发重试机制
 
-    def add_video(self, video_path):
+    def add_video(self, video_path, video_id=None, industry_code=None):
         """将视频添加到数据库并更新缓存
 
         该方法完成以下任务：
@@ -324,6 +317,8 @@ class VideoDuplicateChecker:
 
         Args:
             video_path (str): 待添加视频的文件路径
+            video_id (int, optional): 业务系统视频ID
+            industry_code (str, optional): 业务系统视频分类代码
 
         Returns:
             bool: 添加是否成功
@@ -339,6 +334,14 @@ class VideoDuplicateChecker:
         # 将Path对象转换为字符串
         video_path_str = str(video_path)
 
+        # 如果未提供video_id，生成一个新的
+        if video_id is None:
+            video_id = int(time.time())
+
+        # 如果未提供industry_code，使用默认值
+        if industry_code is None:
+            industry_code = "default"
+
         self.logger.debug("开始提取视频特征...")
         features = self.feature_manager.extract_video_features(video_path)
         feature_hash = self.feature_manager.calculate_feature_hash(features)
@@ -351,7 +354,7 @@ class VideoDuplicateChecker:
             self.db.connection.start_transaction()
 
             # 保存到数据库
-            db_success, video_id = self.save_to_database(video_path_str, feature_hash, file_hash)
+            db_success, video_id = self.save_to_database(video_path_str, feature_hash, file_hash, video_id, industry_code)
             if not db_success:
                 self.logger.error("数据库保存失败，执行回滚")
                 self.db.connection.rollback()
@@ -359,7 +362,7 @@ class VideoDuplicateChecker:
 
             # 更新缓存，使用视频ID
             try:
-                cache_success = self.update_cache(video_id, feature_hash, file_hash)
+                cache_success = self.update_cache(video_id, industry_code, feature_hash, file_hash)
                 if not cache_success:
                     self.logger.error("缓存更新失败，执行回滚")
                     self.db.connection.rollback()
