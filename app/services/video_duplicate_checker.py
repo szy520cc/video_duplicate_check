@@ -154,7 +154,8 @@ class VideoDuplicateChecker:
                 for key in cache_keys:
                     try:
                         # 从键名中提取特征哈希值（去掉"feature_hash:"前缀）
-                        stored_feature_hash = key[5:]
+                        length_of_prefix = len("feature_hash:")
+                        stored_feature_hash = key[length_of_prefix:]
                         stored_id = self.redis.get(key)
 
                         # 使用增强的相似度计算方法
